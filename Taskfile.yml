@@ -1,0 +1,149 @@
+version: '3'
+
+dotenv: ['.env']
+
+vars:
+  GIT_REPO: git@github.com:xXCoolinXx/SPARBackdoor.git
+  GIT_BRANCH: main
+  RP: uv run --project . rp
+
+tasks:
+
+  # ── Pod helpers (also callable standalone) ────────────────────────────────────
+
+  pod:send-git-key:
+    desc: "Upload GitHub SSH key to a running pod (POD_ID=xxx)"
+    requires:
+      vars: [POD_ID, SSH_KEY, GIT_SSH_KEY]
+    vars:
+      SSH_CMD:
+        sh: '{{.RP}} pod ssh-cmd {{.POD_ID}} -i {{.SSH_KEY}}'
+    cmds:
+      - |
+        set -euo pipefail
+        if [ ! -f "{{.GIT_SSH_KEY}}" ]; then
+          echo "ERROR: GIT_SSH_KEY file not found: {{.GIT_SSH_KEY}}" >&2
+          exit 1
+        fi
+        SSH_PORT=$(echo "{{.SSH_CMD}}" | grep -oP '(?<=-p )\d+')
+        SSH_HOST=$(echo "{{.SSH_CMD}}" | grep -oP '(?<=root@)[^ ]+')
+        {{.SSH_CMD}} "mkdir -p ~/.ssh && chmod 700 ~/.ssh"
+        scp -P $SSH_PORT -i {{.SSH_KEY}} "{{.GIT_SSH_KEY}}" "root@${SSH_HOST}:/root/.ssh/id_ed25519"
+        {{.SSH_CMD}} "chmod 600 ~/.ssh/id_ed25519 && ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null"
+        echo "=== GitHub SSH key deployed ==="
+
+  pod:send-secrets:
+    desc: "Upload secrets.env to a running pod (POD_ID=xxx)"
+    requires:
+      vars: [POD_ID, SSH_KEY]
+    vars:
+      SECRETS_FILE: '{{.SECRETS_FILE | default "secrets.env"}}'
+      SSH_CMD:
+        sh: '{{.RP}} pod ssh-cmd {{.POD_ID}} -i {{.SSH_KEY}}'
+    cmds:
+      - |
+        set -euo pipefail
+        if [ ! -f "{{.SECRETS_FILE}}" ]; then
+          echo "No secrets file ({{.SECRETS_FILE}}), skipping."
+          exit 0
+        fi
+        SSH_PORT=$(echo "{{.SSH_CMD}}" | grep -oP '(?<=-p )\d+')
+        SSH_HOST=$(echo "{{.SSH_CMD}}" | grep -oP '(?<=root@)[^ ]+')
+        scp -P $SSH_PORT -i {{.SSH_KEY}} "{{.SECRETS_FILE}}" "root@${SSH_HOST}:/workspace/SPARBackdoor/secrets.env"
+        {{.SSH_CMD}} "cd /workspace/SPARBackdoor && bash infra/scripts/apply-secrets.sh secrets.env"
+        echo "=== Secrets sent and applied ==="
+
+  pod:setup:
+    desc: Run boot script on a running pod (POD_ID=xxx)
+    requires:
+      vars: [POD_ID, SSH_KEY]
+    vars:
+      SSH_CMD:
+        sh: '{{.RP}} pod ssh-cmd {{.POD_ID}} -i {{.SSH_KEY}}'
+    cmds:
+      - |
+        set -euo pipefail
+        SSH_PORT=$(echo "{{.SSH_CMD}}" | grep -oP '(?<=-p )\d+')
+        SSH_HOST=$(echo "{{.SSH_CMD}}" | grep -oP '(?<=root@)[^ ]+')
+
+        # Always send the boot script
+        FILES="scripts/pod-start.sh"
+
+        # Optionally send user setup script and exports file
+        {{if .SETUP_SCRIPT_PATH}}FILES="$FILES {{.SETUP_SCRIPT_PATH}}"{{end}}
+        {{if .EXPORTS_PATH}}FILES="$FILES {{.EXPORTS_PATH}}"{{end}}
+
+        scp -P $SSH_PORT -i {{.SSH_KEY}} $FILES "root@${SSH_HOST}:/tmp/"
+
+        # Run pod-start.sh with env vars pointing to /tmp/ copies
+        {{.SSH_CMD}} "\
+          {{if .SETUP_SCRIPT_PATH}}SETUP_SCRIPT_PATH=/tmp/$(basename {{.SETUP_SCRIPT_PATH}}){{end}} \
+          {{if .EXPORTS_PATH}}EXPORTS_PATH=/tmp/$(basename {{.EXPORTS_PATH}}){{end}} \
+          bash /tmp/pod-start.sh"
+
+  # ── Automated pod deployment ──────────────────────────────────────────────────
+  # Full pipeline: create pod → resolve ID → send secrets → run boot script.
+  # Usage:  task deploy CONFIG=pods/prune-7b.yaml
+
+  # This complicated code is all simply so that we can reuse calling the pod:* helper
+  # tasks. There's no easy way to call a task in cmds and have it set a variable in the
+  # main `deploy` task's context so that it can be accessed by subsequent tasks,
+  # unless we use this workaround of writing vars to files
+  deploy:
+    desc: "Create a pod, send secrets, and run setup (CONFIG=<yaml>)"
+    requires:
+      vars: [CONFIG, SSH_KEY, GIT_SSH_KEY]
+    vars:
+      SECRETS_FILE: '{{.SECRETS_FILE | default "secrets.env"}}'
+      # Tmpfile for passing POD_ID between deploy stages
+      POD_ID_FILE: .deploy-pod-id
+    cmds:
+      - defer: rm -f {{.POD_ID_FILE}}
+      # Create the pod
+      # - '{{.RP}} pod create {{.CONFIG}}'
+      # Resolve name → ID and persist for subsequent subtask calls
+      - |
+        set -euo pipefail
+        POD_NAME=$({{.RP}} -o json pod create {{.CONFIG}} --dry-run 2>/dev/null \
+          | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])")
+        POD_ID=$({{.RP}} pod id "$POD_NAME")
+        echo "$POD_ID" > {{.POD_ID_FILE}}
+        echo "Pod: $POD_NAME ($POD_ID)"
+      # Wait for SSH before running subtasks
+      - |
+        set -euo pipefail
+        POD_ID=$(cat {{.POD_ID_FILE}})
+        echo "Waiting for SSH..."
+        for i in $(seq 1 60); do
+          {{.RP}} pod ssh-cmd "$POD_ID" -i {{.SSH_KEY}} >/dev/null 2>&1 && break
+          sleep 5
+        done
+        {{.RP}} pod ssh-cmd "$POD_ID" -i {{.SSH_KEY}} >/dev/null 2>&1 || {
+          echo "ERROR: Timed out waiting for SSH on $POD_ID" >&2
+          exit 1
+        }
+      # Send GitHub SSH key
+      - task: pod:send-git-key
+        vars:
+          POD_ID:
+            sh: cat {{.POD_ID_FILE}}
+          SSH_KEY: '{{.SSH_KEY}}'
+          GIT_SSH_KEY: '{{.GIT_SSH_KEY}}'
+      # Send secrets
+      - task: pod:send-secrets
+        vars:
+          POD_ID:
+            sh: cat {{.POD_ID_FILE}}
+          SECRETS_FILE: '{{.SECRETS_FILE}}'
+          SSH_KEY: '{{.SSH_KEY}}'
+      # Run boot script
+      - task: pod:setup
+        vars:
+          POD_ID:
+            sh: cat {{.POD_ID_FILE}}
+          SSH_KEY: '{{.SSH_KEY}}'
+          SETUP_SCRIPT_PATH: '{{.SETUP_SCRIPT_PATH | default ""}}'
+          EXPORTS_PATH: '{{.EXPORTS_PATH | default ""}}'
+      - |
+        POD_ID=$(cat {{.POD_ID_FILE}})
+        echo "=== Deploy complete ($POD_ID) ==="
